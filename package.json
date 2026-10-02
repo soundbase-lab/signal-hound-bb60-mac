@@ -1,7 +1,7 @@
 {
-  "name": "soundbase-plugin-template",
-  "version": "0.1.9",
-  "description": "Starting point for a SoundBase plugin: a synthetic spectrum analyzer served by the plugin shell.",
+  "name": "soundbase-plugin-signal-hound-bb60",
+  "version": "0.1.0",
+  "description": "SoundBase plugin: Signal Hound BB60 spectrum analyzers on macOS.",
   "license": "BUSL-1.1",
   "type": "module",
   "main": "main.js",
@@ -10,6 +10,7 @@
   },
   "scripts": {
     "start": "node main.js",
+    "build:worker": "node scripts/build-worker.mjs",
     "test": "node --test __tests__/*.test.js examples/*/__tests__/*.test.js",
     "doctor": "node scripts/doctor.mjs",
     "manifest": "node scripts/validate-manifest.mjs",

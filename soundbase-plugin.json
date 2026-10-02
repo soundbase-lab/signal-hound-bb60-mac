@@ -1,155 +1,75 @@
 {
   "manifestVersion": 1,
-  "id": "template",
-  "name": "SoundBase Plugin Template",
-  "version": "0.1.9",
+  "id": "signal-hound-bb60",
+  "name": "Signal Hound BB60",
+  "version": "0.1.0",
   "license": "BUSL-1.1",
-  "platforms": ["darwin-arm64", "darwin-x64", "win32-x64"],
-  "repository": "https://github.com/your-org/soundbase-plugin-template",
-  "maintainers": [{ "name": "Your Name", "email": "you@example.com" }],
+  "platforms": [
+    "darwin-arm64"
+  ],
+  "repository": "https://github.com/soundbase-lab/signal-hound-bb60-mac",
+  "maintainers": [
+    {
+      "name": "Matt Dale",
+      "email": "matt.dale@soundbase.app"
+    }
+  ],
   "contract": {
     "core": "1.4",
     "modules": {
-      "SpectrumAnalyzer": "1.2",
-      "ChannelMonitoring": "1.0",
-      "PropertyControl": "1.0"
+      "SpectrumAnalyzer": "1.2"
     }
   },
-  "runtime": { "type": "node", "entrypoint": "main.js" },
-  "deployment": ["managed"],
-  "template": { "name": "soundbase-plugin-template", "version": "1.0.11" },
+  "runtime": {
+    "type": "node",
+    "entrypoint": "main.js"
+  },
+  "deployment": [
+    "managed"
+  ],
+  "template": {
+    "name": "soundbase-plugin-template",
+    "version": "1.0.11"
+  },
   "products": [
     {
-      "deviceTypeId": "plugin:template/synthetic",
+      "deviceTypeId": "plugin:signal-hound-bb60/bb60c",
       "manufacturer": {
-        "id": "soundbase",
-        "name": "SoundBase",
-        "logo": {
-          "light": "logos/soundbase-light.svg",
-          "dark": "logos/soundbase-dark.svg"
-        }
+        "id": "signal-hound",
+        "name": "Signal Hound"
       },
       "model": {
-        "id": "synthetic",
-        "name": "Synthetic",
-        "displayName": "Synthetic Analyzer"
+        "id": "bb60c",
+        "name": "BB60C",
+        "displayName": "Signal Hound BB60C"
       },
-      "family": { "id": "template", "name": "Template" },
-      "capabilities": { "spectrumAnalyzer": true },
-      "traits": { "isSpectrumAnalyzer": true }
-    },
-    {
-      "deviceTypeId": "plugin:template/synthetic-iem",
-      "manufacturer": {
-        "id": "soundbase",
-        "name": "SoundBase",
-        "logo": {
-          "light": "logos/soundbase-light.svg",
-          "dark": "logos/soundbase-dark.svg"
-        }
+      "family": {
+        "id": "signal-hound-bb60",
+        "name": "Signal Hound BB60"
       },
-      "model": {
-        "id": "synthetic-iem",
-        "name": "Synthetic IEM",
-        "displayName": "Synthetic Stereo IEM"
-      },
-      "family": { "id": "template", "name": "Template" },
       "capabilities": {
-        "meters": true,
-        "frequency": true,
-        "name": true,
-        "mute": true,
-        "receivers": true
+        "spectrumAnalyzer": true
       },
       "traits": {
-        "isTransmitter": true,
-        "isIem": true,
-        "isRackDevice": true,
-        "channelCount": 2
-      },
-      "channelName": {
-        "maxLength": 8,
-        "uppercase": true,
-        "allowsSpaces": true,
-        "allowedChars": "^[A-Z0-9 _-]*$"
-      },
-      "layout": {
-        "channel": [
-          {
-            "type": "group",
-            "direction": "row",
-            "children": [
-              {
-                "type": "meter",
-                "bind": "meters.af",
-                "metric": "AUDIO_LEVEL",
-                "label": "L"
-              },
-              {
-                "type": "meter",
-                "bind": "meters.afR",
-                "metric": "AUDIO_LEVEL_RIGHT",
-                "label": "R"
-              }
-            ]
-          },
-          {
-            "type": "value",
-            "bind": "frequency",
-            "format": "frequency",
-            "unit": "MHz"
-          },
-          {
-            "type": "value",
-            "bind": "txPower",
-            "format": "integer",
-            "unit": "mW",
-            "label": "TX"
-          },
-          {
-            "type": "indicator",
-            "bind": "mute",
-            "label": "Mute",
-            "tone": "warning"
-          },
-          {
-            "type": "indicator",
-            "bind": "rfState",
-            "label": "RF",
-            "tone": "success"
-          },
-          { "type": "control", "propertyId": "txPower" }
-        ],
-        "device": [
-          { "type": "text", "text": "Synthetic stereo IEM transmitter" }
-        ],
-        "entities": {
-          "receiver": [
-            { "type": "value", "bind": "name" },
-            { "type": "battery", "bind": "battery" },
-            { "type": "meter", "bind": "meters.rf1", "metric": "RF_LEVEL" },
-            { "type": "meter", "bind": "meters.lqi", "metric": "QUALITY" }
-          ]
-        }
+        "isSpectrumAnalyzer": true
       }
+    }
+  ],
+  "stateKeys": [],
+  "deviceConfigFields": [
+    {
+      "id": "serial",
+      "type": "textinput",
+      "label": "Serial number",
+      "help": "Printed on the analyzer. Leave empty to use the first BB60 attached to this computer."
     }
   ],
   "pluginConfigFields": [
     {
-      "id": "sweepIntervalMs",
-      "type": "number",
-      "label": "Simulated sweep interval (ms)",
-      "default": 50
+      "id": "libraryPath",
+      "type": "textinput",
+      "label": "Signal Hound library",
+      "help": "Only if the Signal Hound BB60 library is somewhere unusual: the path to libbb_api.dylib, or to the folder holding it. Leave empty to use the standard location."
     }
-  ],
-  "stateKeys": [
-    "meters",
-    "frequency",
-    "channelName",
-    "mute",
-    "txPower",
-    "rfState",
-    "receivers",
-    { "key": "x.template.packLink", "scope": "channel", "op": "merge" }
   ]
 }

@@ -1,388 +1,365 @@
-// Synthetic adapters — one per module — for the two products the manifest
-// declares. Replace this file (and, for anything with a wire protocol, a
-// driver/ beside it) to build a real plugin: main.js, the manifest shape and
-// the shell stay exactly as they are. A plugin that only does one of the two
-// things below simply does not export the other factory.
+// The Signal Hound BB60 as a SoundBase spectrum analyzer.
+//
+// This file is the contract-facing half: discovery, clamping, the effective
+// configuration echo, warnings. It never touches USB. The analyzer is driven
+// by a worker process — Signal Hound's library behind a JSON-lines pipe — that
+// driver/bb60-driver.js owns and can kill; see docs/native-runtimes.md for why
+// and driver/protocol.md for the wire.
 
-import { HttpError } from '@soundbase/plugin-shell';
+import { Bb60Worker, listDevices } from './driver/bb60-driver.js';
 
-// The products these adapters announce their devices as. Each MUST be one of
-// the `deviceTypeId`s declared in soundbase-plugin.json — the shell warns and
-// the host ignores a device naming a product the manifest never declared.
-// `npm run rename` keeps them in step; a test asserts they agree.
-export const PRODUCT = 'plugin:template/synthetic';
-export const IEM_PRODUCT = 'plugin:template/synthetic-iem';
+// MUST be a `deviceTypeId` declared in soundbase-plugin.json — the host
+// ignores a device naming a product the manifest never declared.
+// `npm run rename` keeps the two in step; a test asserts they agree.
+export const PRODUCT = 'plugin:signal-hound-bb60/bb60c';
 
-// ---------------------------------------------------------------------------
-// SpectrumAnalyzer: a synthetic spectrum
-// ---------------------------------------------------------------------------
+// The vendor library's device types (BB_DEVICE_*) → the product we announce.
+// Only the BB60C has been run against this plugin; a BB60A or BB60D is left
+// out of discovery rather than announced as something it has not been proven
+// to be.
+const PRODUCT_BY_TYPE = { 2: PRODUCT };
 
-const MIN_FREQUENCY_HZ = 100_000;
+const MIN_FREQUENCY_HZ = 9_000;
 const MAX_FREQUENCY_HZ = 6_000_000_000;
-const RBW_HZ = [1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000];
+// 200 kHz is the smallest span Signal Hound suggests sweeping
+const MIN_SPAN_HZ = 200_000;
+// 1 kHz is the floor on Apple Silicon: the ARM build of the vendor library
+// refuses anything narrower in sweep mode
+const RBW_HZ = [
+  1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000, 3_000_000,
+  10_000_000,
+];
+// What an automatic RBW resolves to. Narrow on purpose: every sweep is reduced
+// to the host's points by peak, so a narrow RBW costs no coverage and a few
+// milliseconds, and buys about 15 dB of noise floor over one sized to the
+// point spacing — the difference between seeing a distant carrier and not.
+const AUTO_RBW_HZ = 10_000;
+// The device produces roughly 6.5 FFT bins per RBW across the whole span, and
+// every one is fetched and reduced each sweep. Past a few million the sweep
+// stops being live, so a narrow RBW on a wide span is widened instead.
+const BINS_PER_RBW = 6.6;
+const MAX_DEVICE_BINS = 4_000_000;
+
 const DEFAULT_START_HZ = 470_000_000;
 const DEFAULT_STOP_HZ = 616_000_000;
-const DEFAULT_POINT_DIVISOR = 450;
-const MAX_POINTS = 2000;
-const SWEEP_INTERVAL_MS = 50;
+const DEFAULT_POINTS = 451;
+const MAX_POINTS = 10_001;
+
+const MIN_REF_LEVEL_DBM = -70;
+const MAX_REF_LEVEL_DBM = 20;
+const DEFAULT_REF_LEVEL_DBM = -20;
+const DETECTORS = ['peak', 'average'];
+
+const ADC_OVERFLOW = 2; // bbADCOverflow
+const MIN_USB_VOLTS = 4.4; // below this, Signal Hound says readings are out of spec
+const OVERLOAD_HOLD_MS = 3_000;
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-const round1 = (v) => Math.round(v * 10) / 10;
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
-// a gaussian "signal" bump, height in dB above the noise floor
-const bump = (f, center, width, height) =>
-  height * Math.exp(-(((f - center) / width) ** 2));
 
 const nearestRbw = (hz) =>
   RBW_HZ.reduce((best, candidate) =>
     Math.abs(candidate - hz) < Math.abs(best - hz) ? candidate : best
   );
 
-class SyntheticAnalyzerAdapter {
-  constructor(device, pluginConfig = {}) {
-    this.device = device;
-    this.sweepIntervalMs = isNum(pluginConfig.sweepIntervalMs)
-      ? pluginConfig.sweepIntervalMs
-      : SWEEP_INTERVAL_MS;
-    this.config = {
-      startHz: DEFAULT_START_HZ,
-      stopHz: DEFAULT_STOP_HZ,
-      pointCount: DEFAULT_POINT_DIVISOR + 1,
-      rbwHz: undefined,
-    };
-    this.sweepCount = 0;
-    this.timer = null;
-    this.onFatal = null;
-  }
-
-  async open() {
-    return {
-      capabilities: {
-        minFrequencyHz: MIN_FREQUENCY_HZ,
-        maxFrequencyHz: MAX_FREQUENCY_HZ,
-        rbwHz: [...RBW_HZ],
-      },
-      identity: { model: 'Synthetic', firmware: '0.1.0' },
-    };
-  }
-
-  async applyConfig(cfg = {}) {
-    const startHz = clamp(
-      isNum(cfg.startHz) ? cfg.startHz : this.config.startHz,
-      MIN_FREQUENCY_HZ,
-      MAX_FREQUENCY_HZ
-    );
-    const stopHz = clamp(
-      isNum(cfg.stopHz) ? cfg.stopHz : this.config.stopHz,
-      startHz + 1,
-      MAX_FREQUENCY_HZ
-    );
-    const span = Math.max(1, stopHz - startHz);
-    let pointCount;
-    if (isNum(cfg.pointCount)) {
-      pointCount = Math.round(cfg.pointCount);
-    } else {
-      const step =
-        isNum(cfg.stepHz) && cfg.stepHz > 0
-          ? cfg.stepHz
-          : span / DEFAULT_POINT_DIVISOR;
-      pointCount = Math.round(span / step) + 1;
-    }
-    this.config = {
-      startHz,
-      stopHz,
-      pointCount: clamp(pointCount, 2, MAX_POINTS),
-      rbwHz: isNum(cfg.rbwHz) ? nearestRbw(cfg.rbwHz) : undefined,
-    };
-    return { ...this.config };
-  }
-
-  async startSweep(onTrace) {
-    if (this.timer) return;
-    this.timer = setInterval(
-      () => onTrace(this.buildTrace()),
-      this.sweepIntervalMs
-    );
-    this.timer.unref?.();
-  }
-
-  async stopSweep() {
-    if (!this.timer) return;
-    clearInterval(this.timer);
-    this.timer = null;
-  }
-
-  async close() {
-    await this.stopSweep();
-  }
-
-  buildTrace() {
-    const { startHz, stopHz, pointCount } = this.config;
-    const span = Math.max(1, stopHz - startHz);
-    const amps = new Array(pointCount);
-    const peakA = startHz + span * 0.33;
-    const peakB = startHz + span * 0.66;
-    const transient = startHz + span * 0.5;
-    this.sweepCount += 1;
-    // a transient on roughly one sweep in seven — this is why max-hold has to
-    // accumulate every sweep, not just the ones a client happens to poll
-    const withTransient = this.sweepCount % 7 === 0;
-    for (let i = 0; i < pointCount; i += 1) {
-      const f = startHz + (i * (stopHz - startHz)) / (pointCount - 1);
-      let amp = -100 + (Math.random() * 4 - 2);
-      amp += bump(f, peakA, span * 0.01, 45);
-      amp += bump(f, peakB, span * 0.006, 30);
-      if (withTransient) amp += bump(f, transient, span * 0.003, 50);
-      amps[i] = round1(amp);
-    }
-    return amps;
-  }
-}
-
-export function createSpectrumAnalyzerAdapter(device, pluginConfig) {
-  return new SyntheticAnalyzerAdapter(device, pluginConfig);
-}
-
-// ---------------------------------------------------------------------------
-// ChannelMonitoring + PropertyControl: a synthetic stereo IEM transmitter
-// ---------------------------------------------------------------------------
-//
-// Two stereo channels, each with a bodypack receiver paired to it. Audio
-// meters move on a slow sine so the bars visibly breathe; the packs drain
-// their batteries and wobble their RF. Every property the layout shows is
-// writable through `setProperty`, and the new value comes back as state —
-// which is the whole PropertyControl idea: the device is the truth.
-
-const IEM_CHANNEL_COUNT = 2;
-const IEM_MIN_MHZ = 470;
-const IEM_MAX_MHZ = 608;
-const IEM_STEP_MHZ = 0.025;
-const IEM_NAME_MAX = 8; // mirrors the manifest's channelName.maxLength
-const TX_POWER_MW = [10, 50, 100];
-// The shell coalesces `meters` to one patch per 50 ms tick, so reporting any
-// faster than that is wasted work; a real device reports at whatever rate it
-// has and lets the shell do the coalescing.
-const METER_INTERVAL_MS = 50;
-const PACK_INTERVAL_MS = 1_000;
-
-const quantize = (v, step) => Math.round(v / step) * step;
-const round3 = (v) => Math.round(v * 1000) / 1000;
-const nearestTxPower = (mw) =>
-  TX_POWER_MW.reduce((best, candidate) =>
-    Math.abs(candidate - mw) < Math.abs(best - mw) ? candidate : best
-  );
-
-class SyntheticIemAdapter {
-  constructor(device) {
-    this.device = device;
-    this.channels = {
-      1: {
-        channelName: 'VOX L',
-        frequency: 518.1,
-        txPower: 50,
-        mute: false,
-        rfState: true,
-      },
-      2: {
-        channelName: 'VOX R',
-        frequency: 542.35,
-        txPower: 50,
-        mute: false,
-        rfState: true,
-      },
-    };
-    this.packs = {
-      'pack:1': {
-        id: 'pack:1',
-        name: 'Pack 1',
-        channel: 1,
-        battery: { percent: 92, lifetimeInMinutes: 410 },
-        meters: { rf1: -55, lqi: 96 },
-      },
-      'pack:2': {
-        id: 'pack:2',
-        name: 'Pack 2',
-        channel: 2,
-        battery: { percent: 61, lifetimeInMinutes: 230 },
-        meters: { rf1: -63, lqi: 88 },
-      },
-    };
-    this.phase = 0;
-    this.meterTimer = null;
-    this.packTimer = null;
-    // assigned by the shell before open()
-    this.onState = null;
-    this.onWarnings = null;
-    this.onFatal = null;
-  }
-
-  async open() {
-    // the complete state first, so SoundBase renders a full card at once
-    for (const key of [
-      'channelName',
-      'frequency',
-      'txPower',
-      'mute',
-      'rfState',
-    ])
-      this.emitChannelKey(key);
-    this.onState?.('receivers', {
-      added: Object.values(this.packs).map((pack) => ({ ...pack })),
-      updated: [],
-      removed: [],
-    });
-    // an extension key: which pack each channel feeds, something SoundBase
-    // has no core key for. Declared in the manifest's stateKeys.
-    this.onState?.('x.template.packLink', {
-      channels: { 1: 'pack:1', 2: 'pack:2' },
-    });
-    this.meterTimer = setInterval(() => this.tickMeters(), METER_INTERVAL_MS);
-    this.meterTimer.unref?.();
-    this.packTimer = setInterval(() => this.tickPacks(), PACK_INTERVAL_MS);
-    this.packTimer.unref?.();
-    return {
-      channelCount: IEM_CHANNEL_COUNT,
-      properties: this.properties(),
-      identity: { model: 'Synthetic IEM', firmware: '0.1.0' },
-    };
-  }
-
-  async close() {
-    clearInterval(this.meterTimer);
-    clearInterval(this.packTimer);
-    this.meterTimer = null;
-    this.packTimer = null;
-  }
-
-  /** PropertyControl descriptors, in SoundBase's PropertyDescriptor shape. */
-  properties() {
-    const channel = (id, value) => ({
-      id,
-      scope: 'channel',
-      access: 'readWrite',
-      stateBinding: { key: id },
-      value,
-    });
-    return [
-      channel('txPower', { type: 'enum', options: TX_POWER_MW, unit: 'mW' }),
-      channel('mute', { type: 'boolean' }),
-      channel('frequency', {
-        type: 'number',
-        min: IEM_MIN_MHZ,
-        max: IEM_MAX_MHZ,
-        step: IEM_STEP_MHZ,
-        unit: 'MHz',
-      }),
-      channel('channelName', { type: 'string', maxLength: IEM_NAME_MAX }),
-    ];
-  }
-
-  /** `{ requestId, propertyId, channelIndex?, entityId?, value }` → applied, then reported. */
-  async setProperty({ propertyId, channelIndex, value }) {
-    const ch = this.channels[channelIndex];
-    if (!ch) {
-      throw new HttpError(
-        400,
-        'unknown_channel',
-        `${propertyId} is per channel; channelIndex must be 1..${IEM_CHANNEL_COUNT}`
-      );
-    }
-    switch (propertyId) {
-      case 'txPower':
-        if (!isNum(value)) throw badValue(propertyId, 'a number in mW');
-        ch.txPower = nearestTxPower(value);
-        break;
-      case 'mute':
-        ch.mute = Boolean(value);
-        break;
-      case 'frequency':
-        if (!isNum(value)) throw badValue(propertyId, 'a number in MHz');
-        // clamp and quantize, then echo: the card shows what the device did
-        ch.frequency = round3(
-          quantize(clamp(value, IEM_MIN_MHZ, IEM_MAX_MHZ), IEM_STEP_MHZ)
-        );
-        break;
-      case 'channelName':
-        if (typeof value !== 'string') throw badValue(propertyId, 'a string');
-        ch.channelName = value.trim().toUpperCase().slice(0, IEM_NAME_MAX);
-        break;
-      default:
-        throw new HttpError(
-          400,
-          'unknown_property',
-          `No property ${propertyId} on ${IEM_PRODUCT}`
-        );
-    }
-    this.emitChannelKey(propertyId, channelIndex);
-  }
-
-  emitChannelKey(key, only) {
-    const channels = {};
-    for (const [n, ch] of Object.entries(this.channels)) {
-      if (only === undefined || Number(n) === only) channels[n] = ch[key];
-    }
-    this.onState?.(key, { channels });
-  }
-
-  tickMeters() {
-    this.phase += 0.12;
-    const channels = {};
-    for (const [n, ch] of Object.entries(this.channels)) {
-      const swing = 14 * Math.sin(this.phase + Number(n));
-      const af = ch.mute ? -90 : round1(-24 + swing);
-      channels[n] = { af, afR: round1(af - 2.5), txOn: ch.rfState };
-    }
-    this.onState?.('meters', { timestamp: Date.now(), channels });
-  }
-
-  tickPacks() {
-    const updated = [];
-    for (const pack of Object.values(this.packs)) {
-      pack.battery.percent = Math.max(0, pack.battery.percent - 1);
-      pack.battery.lifetimeInMinutes = Math.max(
-        0,
-        pack.battery.lifetimeInMinutes - 4
-      );
-      pack.meters.rf1 = round1(pack.meters.rf1 + (Math.random() * 4 - 2));
-      pack.meters.lqi = clamp(
-        Math.round(pack.meters.lqi + (Math.random() * 6 - 3)),
-        0,
-        100
-      );
-      updated.push({
-        id: pack.id,
-        changes: { battery: { ...pack.battery }, meters: { ...pack.meters } },
-      });
-    }
-    this.onState?.('receivers', { added: [], updated, removed: [] });
-  }
-}
-
-const badValue = (propertyId, expected) =>
-  new HttpError(400, 'bad_value', `${propertyId} expects ${expected}`);
-
-export function createMonitoringAdapter(device, pluginConfig) {
-  return new SyntheticIemAdapter(device, pluginConfig);
-}
+/** The narrowest listed RBW the device can sweep live across `spanHz`. */
+const narrowestRbwFor = (spanHz) => {
+  const floor = (spanHz * BINS_PER_RBW) / MAX_DEVICE_BINS;
+  return RBW_HZ.find((rbw) => rbw >= floor) ?? RBW_HZ.at(-1);
+};
 
 // ---------------------------------------------------------------------------
 // discovery
 // ---------------------------------------------------------------------------
 
-// one fixed device per product, so the discovery path is exercised end to end
-export async function discoverDevices() {
-  return [
-    {
-      id: 'synthetic:1',
-      name: 'Synthetic Analyzer',
-      product: PRODUCT,
-      transport: { kind: 'synthetic' },
-    },
-    {
-      id: 'synthetic-iem:1',
-      name: 'Synthetic IEM',
-      product: IEM_PRODUCT,
-      transport: { kind: 'synthetic' },
-    },
-  ];
+let listing = null;
+
+/**
+ * BB60s attached right now. Called once a second while SoundBase enumerates —
+ * including the whole time a device is sweeping — so it asks a short-lived
+ * worker for the vendor library's device list and opens nothing. Listing is
+ * safe beside an open, sweeping analyzer. No worker, no Signal Hound library,
+ * nothing attached: all an empty list, never an error.
+ */
+export async function discoverDevices(pluginConfig) {
+  // one listing at a time: a slow one must not stack up behind the cadence
+  listing ??= listDevices(pluginConfig).finally(() => {
+    listing = null;
+  });
+  const devices = await listing;
+  return devices
+    .filter((d) => PRODUCT_BY_TYPE[d.type])
+    .map((d) => ({
+      // The serial number is the analyzer's own identity: stable across
+      // restarts, across USB ports, and across the computers a project moves
+      // between.
+      id: `usb:${d.serial}`,
+      name: `${d.model} ${d.serial}`,
+      product: PRODUCT_BY_TYPE[d.type],
+      transport: { kind: 'usb', serial: String(d.serial) },
+    }));
+}
+
+// ---------------------------------------------------------------------------
+// the adapter
+// ---------------------------------------------------------------------------
+
+export function createSpectrumAnalyzerAdapter(device, pluginConfig) {
+  return new Bb60Adapter(device, pluginConfig);
+}
+
+/**
+ * Which analyzer this device is. `device.config.serial` comes from the
+ * project; a discovered device carries its serial in its id. Neither means
+ * "the first BB60 attached", which is what a single-analyzer rig wants.
+ */
+function serialOf(device) {
+  const fromConfig = Number(String(device.config?.serial ?? '').trim());
+  if (Number.isInteger(fromConfig) && fromConfig > 0) return fromConfig;
+  const match = /^usb:(\d+)$/.exec(device.id ?? '');
+  return match ? Number(match[1]) : null;
+}
+
+class Bb60Adapter {
+  constructor(device, pluginConfig) {
+    this.pluginConfig = pluginConfig;
+    this.serial = serialOf(device);
+    this.worker = null;
+    this.settings = null; // what was last applied, as the device took it
+    this.generation = 0;
+    this.sweeping = false;
+    this.onTrace = null;
+    this.failed = false;
+    this.overloadedAt = 0;
+    this.usbVolts = null;
+    /** assigned by the shell */
+    this.onFatal = null;
+    this.onWarnings = null;
+  }
+
+  async open() {
+    await this.close();
+    this.failed = false;
+    const worker = new Bb60Worker();
+    worker.onFatal = (err) => this.#fail(err);
+    // a sweep the device refuses mid-stream leaves nothing worth keeping open
+    worker.onSweepError = (err) =>
+      this.#fail(new Error(`The BB60 stopped sweeping: ${err.message}.`));
+    worker.onTrace = (msg) => this.#onTrace(msg);
+    worker.onDiagnostics = ({ usbVolts }) => {
+      this.usbVolts = usbVolts;
+      this.#reportWarnings();
+    };
+    // until open() has returned, a worker that dies is an open that failed —
+    // reported by the throw below, not by onFatal as well
+    this.failed = true;
+    let identity;
+    try {
+      worker.start(this.pluginConfig);
+      this.worker = worker;
+      identity = await worker.open(this.serial);
+      this.failed = false;
+    } catch (err) {
+      await this.close();
+      // nothing to open it with: the message already says what to install
+      if (err.setup || !worker.child) throw err;
+      throw new Error(
+        this.serial
+          ? `Could not open BB60 ${this.serial}: ${err.message}. Check it is plugged into a USB 3 port and not in use by another application.`
+          : `Could not open a BB60: ${err.message}. Check one is plugged into a USB 3 port and not in use by another application.`
+      );
+    }
+    this.#reportWarnings();
+
+    return {
+      capabilities: {
+        minFrequencyHz: MIN_FREQUENCY_HZ,
+        maxFrequencyHz: MAX_FREQUENCY_HZ,
+        rbwHz: [...RBW_HZ],
+        controls: [
+          {
+            id: 'refLevelDbm',
+            type: 'number',
+            label: 'Reference level',
+            unit: 'dBm',
+            default: DEFAULT_REF_LEVEL_DBM,
+            min: MIN_REF_LEVEL_DBM,
+            max: MAX_REF_LEVEL_DBM,
+            step: 5,
+            help: 'Set about 5 dB above the strongest signal you expect. Raise it if the analyzer reports an overload.',
+          },
+          {
+            id: 'detector',
+            type: 'dropdown',
+            label: 'Detector',
+            default: 'peak',
+            choices: [
+              { id: 'peak', label: 'Peak' },
+              { id: 'average', label: 'Average' },
+            ],
+            help: 'Peak never misses a carrier narrower than a trace point. Average shows the mean power in each point.',
+          },
+        ],
+      },
+      identity: {
+        manufacturer: 'Signal Hound',
+        model: identity.model,
+        firmware: String(identity.firmware),
+        serial: String(identity.serial),
+      },
+    };
+  }
+
+  /**
+   * Clamp what was asked for to what a BB60 sweeps, apply it, and echo what
+   * the device took. `cfg` is the host's whole desired state: an absent
+   * `rbwHz` means automatic, and `controls` arrives merged by id.
+   */
+  async applyConfig(cfg = {}) {
+    const previous = this.settings ?? {};
+    let startHz = isNum(cfg.startHz)
+      ? cfg.startHz
+      : (previous.startHz ?? DEFAULT_START_HZ);
+    let stopHz = isNum(cfg.stopHz)
+      ? cfg.stopHz
+      : (previous.stopHz ?? DEFAULT_STOP_HZ);
+    startHz = clamp(startHz, MIN_FREQUENCY_HZ, MAX_FREQUENCY_HZ - MIN_SPAN_HZ);
+    stopHz = clamp(stopHz, startHz + MIN_SPAN_HZ, MAX_FREQUENCY_HZ);
+    const spanHz = stopHz - startHz;
+
+    const pointCount = clamp(
+      Math.round(
+        isNum(cfg.pointCount)
+          ? cfg.pointCount
+          : (previous.pointCount ?? DEFAULT_POINTS)
+      ),
+      2,
+      MAX_POINTS
+    );
+
+    const explicitRbw = isNum(cfg.rbwHz);
+    const rbwHz = Math.max(
+      explicitRbw ? nearestRbw(cfg.rbwHz) : AUTO_RBW_HZ,
+      narrowestRbwFor(spanHz)
+    );
+
+    const controls = cfg.controls ?? {};
+    const refLevelDbm = isNum(Number(controls.refLevelDbm ?? NaN))
+      ? clamp(
+          Math.round(Number(controls.refLevelDbm)),
+          MIN_REF_LEVEL_DBM,
+          MAX_REF_LEVEL_DBM
+        )
+      : (previous.refLevelDbm ?? DEFAULT_REF_LEVEL_DBM);
+    const detector = DETECTORS.includes(controls.detector)
+      ? controls.detector
+      : (previous.detector ?? DETECTORS[0]);
+
+    const applied = await this.#worker().configure({
+      startHz,
+      stopHz,
+      pointCount,
+      rbwHz,
+      refLevelDbm,
+      detector,
+    });
+    this.generation = applied.gen;
+    this.settings = {
+      startHz: applied.startHz,
+      stopHz: applied.stopHz,
+      pointCount: applied.pointCount,
+      refLevelDbm: applied.refLevelDbm,
+      detector: applied.detector,
+    };
+    // the reference level changed what counts as an overload
+    this.overloadedAt = 0;
+    this.#reportWarnings();
+
+    const resolved = { sweepTimeMs: Math.ceil(applied.sweepMs) };
+    // An automatic RBW is reported as what auto resolved to, so the user's
+    // field keeps showing "auto"; an explicit one as what the device took.
+    if (!explicitRbw) resolved.rbwHz = applied.rbwHz;
+    return {
+      startHz: applied.startHz,
+      stopHz: applied.stopHz,
+      pointCount: applied.pointCount,
+      ...(explicitRbw ? { rbwHz: applied.rbwHz } : {}),
+      controls: {
+        refLevelDbm: applied.refLevelDbm,
+        detector: applied.detector,
+      },
+      resolved,
+    };
+  }
+
+  async startSweep(onTrace) {
+    this.onTrace = onTrace;
+    if (this.sweeping) return;
+    await this.#worker().startSweep();
+    this.sweeping = true;
+  }
+
+  async stopSweep() {
+    if (!this.sweeping) return;
+    this.sweeping = false;
+    await this.worker?.stopSweep().catch(() => {});
+  }
+
+  /** Release the analyzer: the worker exits, and the device with it. */
+  async close() {
+    this.sweeping = false;
+    const worker = this.worker;
+    this.worker = null;
+    await worker?.close();
+  }
+
+  #worker() {
+    if (!this.worker) throw new Error('The BB60 is not open.');
+    return this.worker;
+  }
+
+  #onTrace({ gen, status, amps }) {
+    // a sweep from before the last applyConfig is on the wrong grid
+    if (!this.sweeping || gen !== this.generation) return;
+    if (amps.length !== this.settings?.pointCount) return;
+    if (status === ADC_OVERFLOW) this.overloadedAt = Date.now();
+    this.#reportWarnings();
+    this.onTrace?.(amps);
+  }
+
+  /** The complete current set, every time; the shell drops repeats. */
+  #reportWarnings() {
+    const warnings = [];
+    if (Date.now() - this.overloadedAt < OVERLOAD_HOLD_MS) {
+      warnings.push({
+        id: 'overload',
+        severity: 'warning',
+        message:
+          'Input overload: a signal is stronger than the reference level, so the trace is distorted. Raise the reference level, or add attenuation at the antenna input.',
+      });
+    }
+    if (isNum(this.usbVolts) && this.usbVolts < MIN_USB_VOLTS) {
+      warnings.push({
+        id: 'usb-voltage',
+        severity: 'warning',
+        message: `USB supply is low (${this.usbVolts.toFixed(2)} V), so levels may be out of specification. Use a shorter or better cable, or a powered USB 3 port.`,
+      });
+    }
+    if (this.worker?.mock) {
+      warnings.push({
+        id: 'simulated',
+        severity: 'info',
+        message:
+          'This is a simulated BB60. The spectrum shown is synthetic, not a measurement.',
+      });
+    }
+    this.onWarnings?.(warnings);
+  }
+
+  #fail(err) {
+    if (this.failed) return;
+    this.failed = true;
+    this.sweeping = false;
+    this.onFatal?.(err);
+  }
 }

@@ -179,6 +179,31 @@ for (const f of shipped) {
 }
 log(`${shipped.length} tracked files: ${shipped.join(', ')}`);
 
+// The one exception to "git decides what ships": the native worker. It is
+// built from tracked source (`npm run build:worker`) and does not belong in
+// git as a binary, and a release without it installs cleanly and then finds
+// no analyzer. It is ours alone: Signal Hound's library is not in this folder
+// and must never be — the user installs it (install-signal-hound-library.sh).
+const BUILT = [join('driver', 'worker', 'bin')];
+for (const dir of BUILT) {
+  if (!existsSync(join(ROOT, dir, 'bb60-worker'))) {
+    refuse(
+      `${dir} has not been built — run \`npm run build:worker\` on an Apple ` +
+        'Silicon Mac first; without it the plugin opens no analyzer'
+    );
+    continue;
+  }
+  const vendor = readdirSync(join(ROOT, dir)).find((f) => /libbb_api/.test(f));
+  if (vendor) {
+    fail(
+      `${dir}/${vendor} is Signal Hound's library, which this plugin does not ` +
+        'distribute — remove it and rebuild with `npm run build:worker`'
+    );
+  }
+  cpSync(join(ROOT, dir), join(packDir, dir), { recursive: true });
+  log(`built: ${dir} (${readdirSync(join(ROOT, dir)).join(', ')})`);
+}
+
 // `.bin` holds symlinks to executables a drop-in plugin folder never runs, and
 // symlinks in a zip are a portability problem for no benefit.
 cpSync(join(ROOT, 'node_modules'), join(packDir, 'node_modules'), {

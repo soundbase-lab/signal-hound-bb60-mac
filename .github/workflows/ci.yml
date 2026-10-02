@@ -28,7 +28,11 @@ jobs:
         # If your plugin talks to hardware, the OS matrix is still worth having:
         # path handling, process termination and line endings differ, and those
         # are exactly the bugs that reach users first.
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        #
+        # macOS is the only platform this plugin runs on: there the native
+        # worker is built and tested against its synthetic device. Ubuntu runs
+        # everything else against the JavaScript fake worker.
+        os: [macos-latest, ubuntu-latest]
         node: [22, 24]
 
     steps:
@@ -48,6 +52,12 @@ jobs:
         # lockfile it produces and every later run takes the reproducible path.
         run: |
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      # A no-op anywhere but Apple Silicon. It needs only a compiler: Signal
+      # Hound's library is installed by the user and loaded at run time, so the
+      # worker is tested here against its own synthetic device.
+      - name: Build the native worker
+        run: npm run build:worker
 
       - name: Check the plugin is well-formed
         run: npm run doctor
