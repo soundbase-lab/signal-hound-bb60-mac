@@ -1,6 +1,6 @@
 {
   "name": "soundbase-plugin-signal-hound-bb60",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "SoundBase plugin: Signal Hound BB60 spectrum analyzers on macOS.",
   "license": "BUSL-1.1",
   "type": "module",
