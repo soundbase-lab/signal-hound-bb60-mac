@@ -61,9 +61,20 @@ Facts established against a real BB60C that are not obvious from the code:
   better and needs a lifecycle hook in `main.js`.
 - **No root is needed**, whatever the vendor README says.
 - **The device picks its own bin count from the RBW** — tens of thousands of
-  bins. The worker reduces every sweep to the host's `pointCount`, by peak or
-  by mean power, before it crosses the pipe. That reduction is the one piece
+  bins. The worker reduces every sweep to the host's `pointCount`, keeping the
+  strongest bin per point, before it crosses the pipe. That reduction is the one piece
   of signal handling this plugin owns; `worker.integration.test.js` covers it.
+- **A raw sweep is noisy (about 5 dB sweep to sweep) and the device does the
+  averaging.** `bbConfigureSweepCoupling`'s sweep time is how long it samples;
+  it averages every spectrum captured in that time, so the time needed for a
+  given steadiness scales with 1/RBW (the Dwell control). The vendor documents
+  1-100 ms; the device honours up to 1 s, and a 1 kHz RBW needs 200 ms before
+  anything changes. A VBW below the RBW does the same job, is silently ignored
+  below 1 kHz, and is the only one of the two that works on a multi-GHz span.
+  The numbers are in the README.
+- **The detector acts over time, never across frequency.** Average or peak is
+  how the device combines spectra; the worker always keeps the strongest bin
+  per point, because a mean across bins averages a narrow carrier away.
 - **Listing devices is safe while one is sweeping**, which matters because
   discovery is polled every second for as long as a device is open.
 - **Only the BB60C is declared.** Add a BB60A or BB60D product to the manifest

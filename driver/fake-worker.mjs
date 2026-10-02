@@ -39,6 +39,8 @@ const config = {
   stopHz: 616_000_000,
   pointCount: 451,
   rbwHz: 100_000,
+  vbwHz: 100_000,
+  captureMs: 1,
   refLevelDbm: -20,
   detector: 'peak',
 };
@@ -48,11 +50,19 @@ function sweep() {
   const { startHz, stopHz, pointCount, rbwHz } = config;
   const step = (stopHz - startHz) / (pointCount - 1);
   const floor = -150 + 10 * Math.log10(rbwHz);
+  // the device averages more spectra into a sweep the narrower the VBW and
+  // the longer it samples, and the noise steadies accordingly
+  const averages = Math.max(
+    1,
+    rbwHz / config.vbwHz,
+    (config.captureMs * rbwHz) / 8000
+  );
+  const jitter = 8 / Math.sqrt(averages);
   const signals = sweeps % 7 === 0 ? [...CARRIERS, TRANSIENT] : CARRIERS;
   const amps = new Array(pointCount);
   for (let i = 0; i < pointCount; i += 1) {
     const f = startHz + i * step;
-    let amp = floor + Math.random() * 4 - 2;
+    let amp = floor + (Math.random() - 0.5) * jitter;
     // a point owns half a step either side of it, so a carrier anywhere in
     // that bucket shows at full height — the peak reduction the real worker does
     for (const [hz, dbm] of signals) {
@@ -84,6 +94,8 @@ function handle({ id, op, ...fields }) {
       config.stopHz = clamp(config.stopHz, config.startHz + 20, MAX_HZ);
       config.pointCount = Math.max(2, Math.round(config.pointCount));
       config.rbwHz = clamp(config.rbwHz, 1_000, 10_000_000);
+      config.vbwHz = clamp(config.vbwHz, 1_000, config.rbwHz);
+      config.captureMs = clamp(config.captureMs, 1, 1_000);
       config.refLevelDbm = Math.min(config.refLevelDbm, 20);
       configured = true;
       gen += 1;

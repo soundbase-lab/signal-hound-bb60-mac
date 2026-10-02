@@ -15,14 +15,16 @@ fields, or `ok: false` with `error` (a sentence) and `status` (the vendor's
 |---|---|---|
 | `list` | | `devices: [{ serial, type, model }]` |
 | `open` | `serial?` — absent opens the first device | `serial, type, model, firmware, apiVersion` |
-| `config` | any of `startHz, stopHz, pointCount, rbwHz, refLevelDbm, detector` | what is in force: all of those, plus `gen, deviceBins, binHz, sweepMs` |
+| `config` | any of `startHz, stopHz, pointCount, rbwHz, vbwHz, captureMs, refLevelDbm, detector` | what is in force: all of those, plus `gen, deviceBins, binHz, sweepMs` |
 | `start` | | |
 | `stop` | | |
 | `quit` | | the worker then exits |
 
 `config` is a patch: absent fields keep their value. The reply's `rbwHz` can
 be wider than the request when the device refuses that bandwidth at that span.
-`sweepMs` is one real sweep, timed, at the new settings.
+`vbwHz` comes back clamped to between 1 kHz and the RBW, and `captureMs` (how
+long the device samples per sweep) to 1–1000. `detector` is `average` or
+`peak`. `sweepMs` is one real sweep, timed, at the new settings.
 
 `bb60-worker --list` prints the `list` reply's fields as one line and exits,
 without opening anything. It is safe while another worker is sweeping.

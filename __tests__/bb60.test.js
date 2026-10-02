@@ -134,6 +134,11 @@ test('open() reports capabilities the host can constrain its UI to', async () =>
     pointCount: POINT_COUNT,
   });
   assert.equal(first.body.controls.autoPoints, true);
+  // ...and the trace is steadied the way a coordinator wants it by default:
+  // mean power, a moderate dwell, and a VBW a tenth of the RBW
+  assert.equal(first.body.controls.detector, 'average');
+  assert.equal(first.body.controls.dwell, 'coordination');
+  assert.equal(first.body.resolved.vbwHz, first.body.resolved.rbwHz / 10);
   assert.equal(
     first.body.pointCount,
     ((STOP_HZ - START_HZ) / first.body.resolved.rbwHz) * 3 + 1
@@ -154,7 +159,7 @@ test('open() reports capabilities the host can constrain its UI to', async () =>
   );
   assert.deepEqual(
     caps.controls.map((c) => c.id),
-    ['refLevelDbm', 'detector', 'autoPoints']
+    ['refLevelDbm', 'dwell', 'detector', 'autoPoints']
   );
   // the shell accumulates all four trace modes in software, so every device
   // advertises them whether or not the hardware has the feature
@@ -277,12 +282,12 @@ test('controls are clamped, merged by id, and echoed as the device took them', a
   });
   assert.equal(first.status, 200);
   assert.equal(first.body.controls.refLevelDbm, 20);
-  assert.equal(first.body.controls.detector, 'peak');
+  assert.equal(first.body.controls.detector, 'average');
 
   const second = await request('POST', `${DEVICE_PATH}/configuration`, {
-    controls: { detector: 'average' },
+    controls: { detector: 'peak' },
   });
-  assert.equal(second.body.controls.detector, 'average');
+  assert.equal(second.body.controls.detector, 'peak');
   assert.equal(
     second.body.controls.refLevelDbm,
     20,
@@ -290,16 +295,53 @@ test('controls are clamped, merged by id, and echoed as the device took them', a
   );
 
   const third = await request('POST', `${DEVICE_PATH}/configuration`, {
-    controls: { detector: 'quasi-peak', refLevelDbm: -20 },
+    controls: { detector: 'quasi-peak', dwell: 'forever', refLevelDbm: -20 },
   });
   assert.equal(
     third.body.controls.detector,
-    'average',
+    'peak',
     'an unknown choice leaves the detector as it was'
   );
+  assert.equal(third.body.controls.dwell, 'coordination');
   await request('POST', `${DEVICE_PATH}/configuration`, {
-    controls: { detector: 'peak' },
+    controls: { detector: 'average' },
   });
+});
+
+// Dwell is what steadies the trace: the analyzer averages every spectrum it
+// captures in that time. A narrow RBW needs a longer capture for the same
+// steadiness, so the same dwell is a slower sweep there.
+test('a longer dwell steadies the noise floor', async (t) => {
+  t.after(async () => {
+    await request('POST', `${DEVICE_PATH}/sweep/stop`);
+    await request('POST', `${DEVICE_PATH}/configuration`, {
+      controls: { dwell: 'coordination' },
+    });
+  });
+  const floorSpread = async (dwell) => {
+    const applied = await request('POST', `${DEVICE_PATH}/configuration`, {
+      startHz: START_HZ,
+      stopHz: STOP_HZ,
+      pointCount: POINT_COUNT,
+      rbwHz: 10_000,
+      controls: { dwell },
+    });
+    assert.equal(applied.body.controls.dwell, dwell);
+    await request('POST', `${DEVICE_PATH}/sweep/start`);
+    const { body } = await request('GET', `${DEVICE_PATH}/trace`);
+    const floor = body.amplitudesDbm.slice(10, 100);
+    return { spread: Math.max(...floor) - Math.min(...floor), applied };
+  };
+
+  const fast = await floorSpread('fast');
+  const coordination = await floorSpread('coordination');
+  assert.ok(
+    coordination.spread < fast.spread / 2,
+    `fast spread ${fast.spread} dB, coordination ${coordination.spread} dB`
+  );
+  // fast asks for no averaging of any kind, so its automatic VBW is the RBW
+  assert.equal(fast.applied.body.resolved.vbwHz, 10_000);
+  assert.equal(coordination.applied.body.resolved.vbwHz, 1_000);
 });
 
 test('a retune leaves the bandwidth and the controls alone', async () => {
@@ -463,6 +505,34 @@ test('max-hold keeps the peak of every sweep, including the transient', async (t
   );
   const held = trace.body.amplitudesDbm[indexOf(TRANSIENT_HZ)];
   assert.ok(held >= -50, `transient never accumulated (peak ${held})`);
+});
+
+// The Apple Silicon library takes no VBW under 1 kHz, and a VBW is never wider
+// than the RBW. What is in force comes back under `resolved`, because the
+// shell echoes the VBW that was asked for.
+test('a video bandwidth is clamped between 1 kHz and the RBW', async () => {
+  const caps = (await findDevice()).capabilities;
+  assert.ok(Math.min(...caps.vbwHz) >= 1_000);
+
+  const wide = await request('POST', `${DEVICE_PATH}/configuration`, {
+    startHz: START_HZ,
+    stopHz: STOP_HZ,
+    pointCount: POINT_COUNT,
+    rbwHz: 30_000,
+    vbwHz: 1_000_000,
+  });
+  assert.equal(wide.status, 200);
+  assert.equal(wide.body.resolved.vbwHz, 30_000);
+
+  const narrow = await request('POST', `${DEVICE_PATH}/configuration`, {
+    vbwHz: 10,
+  });
+  assert.equal(narrow.body.resolved.vbwHz, 1_000);
+
+  const exact = await request('POST', `${DEVICE_PATH}/configuration`, {
+    vbwHz: 3_000,
+  });
+  assert.equal(exact.body.resolved.vbwHz, 3_000);
 });
 
 test('a simulated analyzer says so, where the user will see it', async () => {

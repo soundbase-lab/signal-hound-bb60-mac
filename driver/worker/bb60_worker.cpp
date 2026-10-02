@@ -117,6 +117,10 @@ void loadLibrary(const char *path) {
 
 const double MIN_RBW_HZ = 1.0e3;  // the ARM builds refuse anything narrower
 const double MAX_RBW_HZ = 10.0e6;
+const double MIN_VBW_HZ = 1.0e3;  // narrower is accepted by the ARM build, and ignored
+// The vendor documents 1-100 ms. Measured on a BB60C, the device honours up to
+// a second, and nothing shorter than 200 ms smooths a 1 kHz RBW at all.
+const double MIN_CAPTURE_MS = 1.0, MAX_CAPTURE_MS = 1000.0;
 const int MOCK_SERIAL = 60000001;
 const double DIAG_INTERVAL_S = 2.0;
 
@@ -125,6 +129,8 @@ struct SweepConfig {
     double stopHz = 616.0e6;
     int pointCount = 451;
     double rbwHz = 100.0e3;
+    double vbwHz = 100.0e3;   // equal to the RBW means no video filtering
+    double captureMs = 1.0;   // how long the device samples for one sweep
     double refLevelDbm = -20.0;
     bool average = false;  // detector: false = peak
 };
@@ -272,18 +278,27 @@ double nextRbw(double rbw) {
 
 double mockNoiseFloor(double rbw) { return -150.0 + 10.0 * log10(rbw); }
 
+// How many spectra the device averages into one sweep, roughly as measured on
+// a BB60C: video filtering gives RBW/VBW of them, and capture time buys more
+// the wider the RBW.
+double mockAverages() {
+    return fmax(1.0, fmax(config.rbwHz / config.vbwHz,
+                          config.captureMs * config.rbwHz / 8000.0));
+}
+
 // A device-shaped trace: its own bin spacing, a noise floor that follows the
-// RBW, and two carriers far narrower than a host point — which is the case the
-// reduction below exists for. A transient lands on one sweep in seven, so
-// max-hold is exercised too.
+// RBW and steadies with averaging, and two carriers far narrower than a host
+// point — which is the case the reduction below exists for. A transient lands
+// on one sweep in seven, so max-hold is exercised too.
 void mockFetch() {
     ++mockSweeps;
     const double floorDbm = mockNoiseFloor(config.rbwHz);
+    const double jitterDb = 8.0 / sqrt(mockAverages());
     const double carriers[][2] = {{518.1e6, -45.0}, {566.3e6, -60.0}};
     const bool transient = mockSweeps % 7 == 0;
     for (uint32_t i = 0; i < device.bins; ++i) {
         const double f = device.startHz + i * device.binHz;
-        double amp = floorDbm + (rand() / (double)RAND_MAX) * 4.0 - 2.0;
+        double amp = floorDbm + (rand() / (double)RAND_MAX - 0.5) * jitterDb;
         for (const auto &c : carriers) {
             const double off = fabs(f - c[0]) / config.rbwHz;
             if (off < 3.0) amp = fmax(amp, c[1] - 12.0 * off * off);
@@ -294,7 +309,7 @@ void mockFetch() {
         }
         traceMax[i] = (float)amp;
     }
-    usleep(15000);
+    usleep((useconds_t)(15000 + fmin(config.captureMs, 100.0) * 1000));
 }
 
 // Returns a bbStatus: negative is an error, positive a warning.
@@ -308,10 +323,12 @@ int fetchSweep() {
 }
 
 // Put the device's trace onto the host's grid: point i sits at
-// startHz + i * step, and takes every device bin within half a step of it.
-// Peak keeps the strongest bin, so a carrier narrower than a point is never
-// lost; average takes the mean power. A point with no bin of its own (more
-// points asked for than the device produced) takes the nearest bin.
+// startHz + i * step, and takes the strongest device bin within half a step of
+// it — so a carrier narrower than a point is never lost. That holds for both
+// detectors: the detector decides how the device combines spectra over time
+// (peak, or mean power), never how bins are combined across frequency, where a
+// mean would average a narrow carrier away. A point with no bin of its own
+// (more points asked for than the device produced) takes the nearest bin.
 void reduce() {
     const int points = config.pointCount;
     const double step = (config.stopHz - config.startHz) / (points - 1);
@@ -324,16 +341,10 @@ void reduce() {
         if (hi < lo) lo = hi = lround((f - device.startHz) / device.binHz);
         lo = lo < 0 ? 0 : (lo > last ? last : lo);
         hi = hi < 0 ? 0 : (hi > last ? last : hi);
-        if (config.average) {
-            double sum = 0;
-            for (long k = lo; k <= hi; ++k) sum += pow(10.0, traceMax[k] / 10.0);
-            reduced[i] = (float)(10.0 * log10(sum / (double)(hi - lo + 1)));
-        } else {
-            float peak = traceMax[lo];
-            for (long k = lo + 1; k <= hi; ++k)
-                if (traceMax[k] > peak) peak = traceMax[k];
-            reduced[i] = peak;
-        }
+        float peak = traceMax[lo];
+        for (long k = lo + 1; k <= hi; ++k)
+            if (traceMax[k] > peak) peak = traceMax[k];
+        reduced[i] = peak;
     }
 }
 
@@ -378,6 +389,8 @@ void handleConfig(long id, const std::string &line) {
     if (getNumber(line, "stopHz", v)) next.stopHz = v;
     if (getNumber(line, "pointCount", v)) next.pointCount = (int)lround(v);
     if (getNumber(line, "rbwHz", v)) next.rbwHz = v;
+    if (getNumber(line, "vbwHz", v)) next.vbwHz = v;
+    if (getNumber(line, "captureMs", v)) next.captureMs = v;
     if (getNumber(line, "refLevelDbm", v)) next.refLevelDbm = v;
     if (getString(line, "detector", detector)) next.average = detector == "average";
 
@@ -387,6 +400,12 @@ void handleConfig(long id, const std::string &line) {
     if (next.stopHz - next.startHz < BB_MIN_SPAN) next.stopHz = next.startHz + BB_MIN_SPAN;
     if (next.pointCount < 2) next.pointCount = 2;
     next.rbwHz = fmin(fmax(next.rbwHz, MIN_RBW_HZ), MAX_RBW_HZ);
+    next.captureMs = fmin(fmax(next.captureMs, MIN_CAPTURE_MS), MAX_CAPTURE_MS);
+    // a video bandwidth is never wider than the resolution bandwidth
+    const auto clampVbw = [](SweepConfig &c) {
+        c.vbwHz = fmin(fmax(c.vbwHz, MIN_VBW_HZ), c.rbwHz);
+    };
+    clampVbw(next);
     next.refLevelDbm = fmin(next.refLevelDbm, BB_MAX_REFERENCE);
 
     const double span = next.stopHz - next.startHz;
@@ -404,7 +423,8 @@ void handleConfig(long id, const std::string &line) {
             bbConfigureRefLevel(handle, next.refLevelDbm);
             bbConfigureGainAtten(handle, BB_AUTO_GAIN, BB_AUTO_ATTEN);
             bbConfigureCenterSpan(handle, next.startHz + span / 2, span);
-            bbConfigureSweepCoupling(handle, next.rbwHz, next.rbwHz, 0.001,
+            bbConfigureSweepCoupling(handle, next.rbwHz, next.vbwHz,
+                                     next.captureMs / 1000.0,
                                      BB_RBW_SHAPE_FLATTOP, BB_NO_SPUR_REJECT);
             bbConfigureAcquisition(handle, next.average ? BB_AVERAGE : BB_MIN_AND_MAX,
                                    BB_LOG_SCALE);
@@ -412,6 +432,7 @@ void handleConfig(long id, const std::string &line) {
             s = bbInitiate(handle, BB_SWEEPING, 0);
             if (s == bbBandwidthErr && next.rbwHz < MAX_RBW_HZ) {
                 next.rbwHz = fmin(nextRbw(next.rbwHz), MAX_RBW_HZ);
+                clampVbw(next);
                 continue;
             }
             break;
@@ -455,6 +476,8 @@ void handleConfig(long id, const std::string &line) {
                     ",\"stopHz\":" + num(config.stopHz) +
                     ",\"pointCount\":" + std::to_string(config.pointCount) +
                     ",\"rbwHz\":" + num(config.rbwHz) +
+                    ",\"vbwHz\":" + num(config.vbwHz) +
+                    ",\"captureMs\":" + num(config.captureMs) +
                     ",\"refLevelDbm\":" + num(config.refLevelDbm) +
                     ",\"detector\":" + (config.average ? "\"average\"" : "\"peak\"") +
                     ",\"deviceBins\":" + std::to_string(device.bins) +

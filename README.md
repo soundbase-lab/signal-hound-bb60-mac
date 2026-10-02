@@ -77,16 +77,42 @@ script again also checks: it ends by reporting the analyzer it found.
 | Range | 9 kHz – 6 GHz |
 | RBW | 1 kHz – 10 MHz. 1 kHz is the narrowest the Apple Silicon library sweeps. An RBW too narrow for the span is widened, and SoundBase shows what was used. |
 | Automatic RBW | 10 kHz |
-| Sweep speed | About 17 ms for 470–616 MHz at 10 kHz RBW; about 0.3 s for the full 6 GHz |
-| Controls | Reference level (−70 to +20 dBm, default −20), detector (peak or average), and automatic points per sweep |
+| VBW | 1 kHz up to the RBW; automatic is a tenth of the RBW. 1 kHz is the narrowest the Apple Silicon library applies. |
+| Dwell | How long the analyzer samples per sweep: Fast, Coordination (default) or High quality. See below. |
+| Detector | RMS average (default) or positive peak |
+| Reference level | −70 to +20 dBm, default −20 |
 | Automatic points | On by default: the point count is 3 per RBW across the span (span ÷ RBW × 3), up to 50,000, and the typed point count is ignored. Turn it off to set the point count yourself. |
 | Warnings | Input overload, low USB supply voltage |
 
-The analyzer produces far more points than SoundBase draws — about 60,000 for
-a UHF sweep at 10 kHz. Each sweep is reduced to the points SoundBase asked for
-by taking the **peak** in each, so a carrier narrower than a point on the plot
-is never lost. The average detector reports the mean power in each point
-instead.
+### A steady trace
+
+A single spectrum from the analyzer is noisy: about 5 dB of sweep-to-sweep
+movement on the noise floor. The plugin steadies it the way a bench analyzer
+does, by having the BB60 average many spectra into each sweep:
+
+- **Dwell** sets how long it samples. A narrow RBW needs a longer sample for
+  the same steadiness, so a given dwell is a slower sweep at a narrower RBW.
+- **VBW** narrower than the RBW does the same job, and is what steadies a span
+  too wide for the dwell to matter.
+- **RMS average** shows the mean power, which puts the noise floor where it
+  really is. **Positive peak** holds the strongest reading during the dwell
+  instead: it catches short bursts, and shows the floor a few dB high.
+
+Measured on a BB60C, 470–616 MHz, RMS average:
+
+| RBW | Fast | Coordination | High quality |
+|---|---|---|---|
+| 10 kHz | 21 ms per sweep, 4.5 dB of noise | 46 ms, 0.7 dB | 82 ms, 0.5 dB |
+| 3 kHz | 31 ms, 3.2 dB | 84 ms, 0.8 dB | 231 ms, 0.4 dB |
+| 1 kHz | 81 ms, 2.1 dB | 235 ms, 0.6 dB | 927 ms, 0.3 dB |
+
+For a faster trace, choose Fast; for a transient you must not miss, choose
+positive peak, or use SoundBase's max-hold trace mode.
+
+The analyzer produces far more points than SoundBase draws at a typed point
+count — about 60,000 for a UHF sweep at 10 kHz. Each sweep is reduced to the
+points in use by taking the **strongest** reading in each, with either
+detector, so a carrier narrower than a point on the plot is never lost.
 
 Only one program can use a BB60 at a time. Close Spike, or anything else
 holding the analyzer, before sweeping from SoundBase.
