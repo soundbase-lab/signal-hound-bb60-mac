@@ -44,6 +44,15 @@ const DEFAULT_START_HZ = 470_000_000;
 const DEFAULT_STOP_HZ = 616_000_000;
 const DEFAULT_POINTS = 451;
 const MAX_POINTS = 10_001;
+// Automatic points: this many per RBW across the span, so adjacent points
+// overlap and nothing the RBW can resolve falls between two of them.
+const AUTO_POINTS_PER_RBW = 3;
+// Every point crosses a pipe and an HTTP response, every sweep. This keeps a
+// wide span at a narrow RBW live; past it the count is capped and echoed.
+const MAX_AUTO_POINTS = 50_001;
+// On unless the user turns it off: the trace then shows everything the RBW
+// resolves, rather than whatever a typed point count happens to leave.
+const DEFAULT_AUTO_POINTS = true;
 
 const MIN_REF_LEVEL_DBM = -70;
 const MAX_REF_LEVEL_DBM = 20;
@@ -199,6 +208,13 @@ class Bb60Adapter {
             ],
             help: 'Peak never misses a carrier narrower than a trace point. Average shows the mean power in each point.',
           },
+          {
+            id: 'autoPoints',
+            type: 'checkbox',
+            label: 'Automatic points per sweep',
+            default: DEFAULT_AUTO_POINTS,
+            help: `Sets the number of points from the span and RBW (${AUTO_POINTS_PER_RBW} per RBW), up to ${(MAX_AUTO_POINTS - 1).toLocaleString('en-US')}, and ignores the point count above. Turn it off to set the point count yourself.`,
+          },
         ],
       },
       identity: {
@@ -227,16 +243,6 @@ class Bb60Adapter {
     stopHz = clamp(stopHz, startHz + MIN_SPAN_HZ, MAX_FREQUENCY_HZ);
     const spanHz = stopHz - startHz;
 
-    const pointCount = clamp(
-      Math.round(
-        isNum(cfg.pointCount)
-          ? cfg.pointCount
-          : (previous.pointCount ?? DEFAULT_POINTS)
-      ),
-      2,
-      MAX_POINTS
-    );
-
     const explicitRbw = isNum(cfg.rbwHz);
     const rbwHz = Math.max(
       explicitRbw ? nearestRbw(cfg.rbwHz) : AUTO_RBW_HZ,
@@ -244,6 +250,28 @@ class Bb60Adapter {
     );
 
     const controls = cfg.controls ?? {};
+    const autoPoints =
+      typeof controls.autoPoints === 'boolean'
+        ? controls.autoPoints
+        : (previous.autoPoints ?? DEFAULT_AUTO_POINTS);
+    // the count the user typed is kept while automatic is on, so switching
+    // back returns to it rather than to whatever automatic last worked out
+    const manualPoints = clamp(
+      Math.round(
+        isNum(cfg.pointCount)
+          ? cfg.pointCount
+          : (previous.manualPoints ?? DEFAULT_POINTS)
+      ),
+      2,
+      MAX_POINTS
+    );
+    const pointCount = autoPoints
+      ? clamp(
+          Math.round((spanHz / rbwHz) * AUTO_POINTS_PER_RBW) + 1,
+          2,
+          MAX_AUTO_POINTS
+        )
+      : manualPoints;
     const refLevelDbm = isNum(Number(controls.refLevelDbm ?? NaN))
       ? clamp(
           Math.round(Number(controls.refLevelDbm)),
@@ -268,6 +296,8 @@ class Bb60Adapter {
       startHz: applied.startHz,
       stopHz: applied.stopHz,
       pointCount: applied.pointCount,
+      manualPoints,
+      autoPoints,
       refLevelDbm: applied.refLevelDbm,
       detector: applied.detector,
     };
@@ -287,6 +317,7 @@ class Bb60Adapter {
       controls: {
         refLevelDbm: applied.refLevelDbm,
         detector: applied.detector,
+        autoPoints,
       },
       resolved,
     };

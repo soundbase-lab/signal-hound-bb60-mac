@@ -125,9 +125,22 @@ test('no worker on this machine is an empty listing, not an error', async (t) =>
 // idle plugin must not hold the analyzer. So `capabilities` is null in the
 // first /devices listing and appears after the first operation on it.
 test('open() reports capabilities the host can constrain its UI to', async () => {
-  await request('POST', `${DEVICE_PATH}/configuration`, {
+  // The first configuration this device has seen, so also the defaults:
+  // automatic points are on, and the echo carries the count they work out to
+  // (three per RBW across the span, at the 10 kHz an automatic RBW resolves to).
+  const first = await request('POST', `${DEVICE_PATH}/configuration`, {
     startHz: START_HZ,
     stopHz: STOP_HZ,
+    pointCount: POINT_COUNT,
+  });
+  assert.equal(first.body.controls.autoPoints, true);
+  assert.equal(
+    first.body.pointCount,
+    ((STOP_HZ - START_HZ) / first.body.resolved.rbwHz) * 3 + 1
+  );
+  // every test from here on sets its own point count
+  await request('POST', `${DEVICE_PATH}/configuration`, {
+    controls: { autoPoints: false },
   });
 
   const device = await findDevice();
@@ -141,7 +154,7 @@ test('open() reports capabilities the host can constrain its UI to', async () =>
   );
   assert.deepEqual(
     caps.controls.map((c) => c.id),
-    ['refLevelDbm', 'detector']
+    ['refLevelDbm', 'detector', 'autoPoints']
   );
   // the shell accumulates all four trace modes in software, so every device
   // advertises them whether or not the hardware has the feature
@@ -309,6 +322,73 @@ test('a retune leaves the bandwidth and the controls alone', async () => {
 
   const read = await request('GET', `${DEVICE_PATH}/configuration`);
   assert.deepEqual(read.body, body, 'GET reports what POST echoed');
+});
+
+// Automatic points: three per RBW across the span, whatever point count the
+// host has saved — and the echo is how the host learns how many that is.
+test('automatic points follow the span and RBW, and the trace matches', async (t) => {
+  t.after(async () => {
+    await request('POST', `${DEVICE_PATH}/sweep/stop`);
+    await request('POST', `${DEVICE_PATH}/configuration`, {
+      startHz: START_HZ,
+      stopHz: STOP_HZ,
+      pointCount: POINT_COUNT,
+      controls: { autoPoints: false },
+    });
+  });
+  const applied = await request('POST', `${DEVICE_PATH}/configuration`, {
+    startHz: 500_000_000,
+    stopHz: 510_000_000,
+    pointCount: POINT_COUNT,
+    rbwHz: 100_000,
+    controls: { autoPoints: true },
+  });
+  assert.equal(applied.status, 200);
+  assert.equal(applied.body.controls.autoPoints, true);
+  assert.equal(applied.body.pointCount, (10_000_000 / 100_000) * 3 + 1);
+
+  await request('POST', `${DEVICE_PATH}/sweep/start`);
+  const trace = await request('GET', `${DEVICE_PATH}/trace`);
+  assert.equal(trace.body.amplitudesDbm.length, 301);
+  assert.equal(trace.body.startHz, 500_000_000);
+  assert.equal(trace.body.stopHz, 510_000_000);
+
+  // a narrower RBW or a wider span moves the count with it
+  const narrower = await request('POST', `${DEVICE_PATH}/configuration`, {
+    rbwHz: 10_000,
+  });
+  assert.equal(narrower.body.pointCount, 3_001);
+  const wider = await request('POST', `${DEVICE_PATH}/configuration`, {
+    startHz: 500_000_000,
+    stopHz: 520_000_000,
+  });
+  assert.equal(wider.body.pointCount, 6_001);
+  assert.equal(wider.body.controls.autoPoints, true, 'a retune leaves it on');
+});
+
+test('automatic points are capped on a wide span, and switch back off cleanly', async () => {
+  const caps = (await findDevice()).capabilities;
+  const wide = await request('POST', `${DEVICE_PATH}/configuration`, {
+    startHz: caps.minFrequencyHz,
+    stopHz: caps.maxFrequencyHz,
+    pointCount: POINT_COUNT,
+    rbwHz: 10_000,
+    controls: { autoPoints: true },
+  });
+  assert.equal(wide.status, 200);
+  assert.equal(wide.body.pointCount, 50_001, 'not the 1.8 million it works out to');
+
+  const manual = await request('POST', `${DEVICE_PATH}/configuration`, {
+    startHz: START_HZ,
+    stopHz: STOP_HZ,
+    controls: { autoPoints: false },
+  });
+  assert.equal(manual.body.controls.autoPoints, false);
+  assert.equal(
+    manual.body.pointCount,
+    POINT_COUNT,
+    'back to the count the host asked for'
+  );
 });
 
 test('successive polls see successive sweeps', async (t) => {
