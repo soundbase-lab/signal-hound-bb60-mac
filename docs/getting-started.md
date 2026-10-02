@@ -8,10 +8,10 @@ From nothing to a running plugin, then to a plugin that is yours.
   account.
 - SoundBase Desktop, eventually, if you want to see your device in the app —
   but not for anything on this page.
-- **A GitHub account, and a plugin you are willing to make public.** A plugin
-  reaches users through the Lab, which lists a **public repository on
-  GitHub** and installs from its GitHub Releases. A private repository cannot
-  be listed, and no other host works. See [publishing.md](publishing.md).
+- **For publishing:** a GitHub account and a plugin you are willing to make
+  public. Local development does not require either. The Lab lists a **public
+  repository on GitHub** and installs from its GitHub Releases; private
+  repositories and other hosts are unsupported. See [publishing.md](publishing.md).
 
 ## 1. Get the code
 
