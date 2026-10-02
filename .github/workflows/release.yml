@@ -46,7 +46,9 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # Apple Silicon: the zip carries a native worker built here. It does not
+    # carry Signal Hound's library — the user installs that themselves.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
 
@@ -59,6 +61,11 @@ jobs:
         shell: bash
         run: |
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      # Into driver/worker/bin/, which is gitignored — so it does not make the
+      # tree dirty — and which the pack step carries into the zip.
+      - name: Build the native worker
+        run: npm run build:worker
 
       # A manual run that asked for a release: move the version and make the
       # release commit and tag here, locally. They are pushed only after every

@@ -23,12 +23,56 @@ The author writes device logic. The author never writes UI, IPC, or HTTP.
 soundbase-plugin.json   identity, products, config fields
 main.js                 shell bootstrap — never edit
 adapter.js              device logic — this is the file that changes
-driver/                 optional: protocol-specific code adapter.js uses
+driver/                 the BB60 worker, the driver that owns it, and a fake worker
 __tests__/              contract tests, driven through the real shell
 examples/network-analyzer/   a second complete plugin, over TCP, with a fake device
 docs/                   the guide set; docs/README.md indexes it
-scripts/                doctor, smoke, manifest, rename, bump-version, release, pack-release
+scripts/                doctor, smoke, manifest, rename, bump-version, build-worker, pack-release
 ```
+
+## This plugin: the Signal Hound BB60
+
+`adapter.js` never touches USB. Each open analyzer is a worker process
+(`driver/worker/bb60_worker.cpp`) linking Signal Hound's `libbb_api`, driven by
+`driver/bb60-driver.js` over JSON lines — `driver/protocol.md` is the wire.
+`npm run build:worker` compiles it into `driver/worker/bin/`, which is
+gitignored.
+
+**Signal Hound's library is never part of this repository or a release.** That
+is a licensing decision, not a convenience: the user installs it from Signal
+Hound (`install-signal-hound-library.sh`, or by hand per the README), the
+driver finds it (`findLibrary`), and the worker `dlopen`s it from `--lib`. So
+do not vendor `bb_api.h` or the dylib, do not link against it, and do not add
+a build step that downloads it. The few API names and constants the worker
+uses are restated at the top of `bb60_worker.cpp`.
+
+Facts established against a real BB60C that are not obvious from the code:
+
+- **Never call `bbCloseDevice`.** It traps in the macOS build (5.0.11) after a
+  successful open. A device is released by `bbAbort` and the worker exiting.
+- **Apple Silicon only, sweeps and I/Q only, RBW no narrower than 1 kHz.**
+  Those are the vendor library's limits on macOS, not choices made here.
+- **The library links Homebrew's libusb by absolute path.** Without libusb
+  the library fails to load; the driver turns that into a message naming
+  `brew install libusb`.
+- **A Mac without the library finds no devices, silently, in the UI.** The
+  reason goes to the plugin log once, and to the device's status if one is
+  added by hand. Reporting it as the plugin's `needs-setup` status would be
+  better and needs a lifecycle hook in `main.js`.
+- **No root is needed**, whatever the vendor README says.
+- **The device picks its own bin count from the RBW** — tens of thousands of
+  bins. The worker reduces every sweep to the host's `pointCount`, by peak or
+  by mean power, before it crosses the pipe. That reduction is the one piece
+  of signal handling this plugin owns; `worker.integration.test.js` covers it.
+- **Listing devices is safe while one is sweeping**, which matters because
+  discovery is polled every second for as long as a device is open.
+- **Only the BB60C is declared.** Add a BB60A or BB60D product to the manifest
+  and to `PRODUCT_BY_TYPE` once one has actually been swept.
+
+Tests run against `driver/fake-worker.mjs` (`SB_BB60_MOCK=1`) on any platform,
+and against the native worker's synthetic device (`SB_BB60_MOCK=native`) where
+it has been built. A change to the worker protocol changes all three: the C++
+worker, the fake, and `driver/protocol.md`.
 
 ## Invariants — do not violate these without being asked
 
@@ -103,6 +147,7 @@ they are authoritative in a way that any summary — including this file — is 
 In order of what they prove:
 
 ```sh
+npm run build:worker  # only after changing driver/worker/ — Apple Silicon
 npm run doctor    # is the plugin well-formed at all?
 npm test          # adapter through the real shell, over HTTP
 npm run manifest  # the manifest the host will refuse or accept

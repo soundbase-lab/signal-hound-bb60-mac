@@ -7,3 +7,6 @@ runtime/
 # CPython bytecode, regenerated per interpreter version
 __pycache__/
 *.pyc
+
+# the native worker, built by `npm run build:worker`, never committed
+driver/worker/bin/
