@@ -78,7 +78,8 @@ script again also checks: it ends by reporting the analyzer it found.
 | RBW | 1 kHz – 10 MHz. 1 kHz is the narrowest the Apple Silicon library sweeps. An RBW too narrow for the span is widened, and SoundBase shows what was used. |
 | Automatic RBW | 10 kHz |
 | Sweep speed | About 17 ms for 470–616 MHz at 10 kHz RBW; about 0.3 s for the full 6 GHz |
-| Controls | Reference level (−70 to +20 dBm, default −20) and detector (peak or average) |
+| Controls | Reference level (−70 to +20 dBm, default −20), detector (peak or average), and automatic points per sweep |
+| Automatic points | On by default: the point count is 3 per RBW across the span (span ÷ RBW × 3), up to 50,000, and the typed point count is ignored. Turn it off to set the point count yourself. |
 | Warnings | Input overload, low USB supply voltage |
 
 The analyzer produces far more points than SoundBase draws — about 60,000 for
