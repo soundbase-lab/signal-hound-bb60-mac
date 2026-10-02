@@ -20,14 +20,14 @@
     "pack:release": "node scripts/pack-release.mjs"
   },
   "dependencies": {
-    "@soundbase/plugin-contract": "^0.10.1",
-    "@soundbase/plugin-shell": "^0.10.1"
+    "@soundbase/plugin-contract": "^0.12.0",
+    "@soundbase/plugin-shell": "^0.12.0"
   },
   "soundbase": {
     "template": {
       "name": "soundbase-plugin-template",
-      "version": "1.0.11"
+      "version": "1.0.12"
     },
-    "generatedFrom": "f13b18ab7933dfbbcb26449c278a129d448d2ba8"
+    "generatedFrom": "ef3aab463e04873022678a25e813b1581574eb81"
   }
 }
