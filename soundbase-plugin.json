@@ -61,7 +61,7 @@
       "id": "serial",
       "type": "textinput",
       "label": "Serial number",
-      "help": "Printed on the analyzer. Leave empty to use the first BB60 attached to this computer."
+      "help": "Leave empty to use the first BB60 found."
     }
   ],
   "pluginConfigFields": [
@@ -69,7 +69,7 @@
       "id": "libraryPath",
       "type": "textinput",
       "label": "Signal Hound library",
-      "help": "Only if the Signal Hound BB60 library is somewhere unusual: the path to libbb_api.dylib, or to the folder holding it. Leave empty to use the standard location."
+      "help": "Only if libbb_api.dylib is not in the standard location."
     }
   ]
 }

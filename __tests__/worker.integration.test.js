@@ -79,7 +79,10 @@ test('a carrier far narrower than a trace point survives the reduction', { skip 
   assert.ok(amps[at + 2] < -100, 'and only where the carrier is');
 });
 
-test('the average detector reports mean power, below the peak', { skip }, async (t) => {
+// The detector decides how the device combines spectra over time. Across
+// frequency the worker always keeps the strongest bin, whatever the detector:
+// a mean there would average a narrow carrier into the noise.
+test('the average detector still shows a narrow carrier at full height', { skip }, async (t) => {
   const worker = await openWorker(t);
   const applied = await worker.configure({
     startHz: START_HZ,
@@ -92,7 +95,37 @@ test('the average detector reports mean power, below the peak', { skip }, async 
   await worker.startSweep();
   const { amps } = await nextTrace(worker, applied.gen);
   const at = indexOf(CARRIER_HZ, 451);
-  assert.ok(amps[at] < -50 && amps[at] > -80, `carrier averaged to ${amps[at]}`);
+  assert.ok(amps[at] > -47 && amps[at] <= -45, `carrier read ${amps[at]} dBm`);
+});
+
+test('video bandwidth and capture time are clamped and steady the floor', { skip }, async (t) => {
+  const worker = await openWorker(t);
+  const spread = async (fields) => {
+    const applied = await worker.configure({
+      startHz: START_HZ,
+      stopHz: STOP_HZ,
+      pointCount: 451,
+      rbwHz: 10_000,
+      ...fields,
+    });
+    await worker.startSweep();
+    const { amps } = await nextTrace(worker, applied.gen);
+    const floor = amps.slice(10, 100);
+    return { applied, spread: Math.max(...floor) - Math.min(...floor) };
+  };
+
+  const raw = await spread({ vbwHz: 10_000, captureMs: 1 });
+  const filtered = await spread({ vbwHz: 1_000, captureMs: 1 });
+  const dwelt = await spread({ vbwHz: 10_000, captureMs: 40 });
+  assert.ok(filtered.spread < raw.spread / 2, `${raw.spread} -> ${filtered.spread}`);
+  assert.ok(dwelt.spread < raw.spread / 2, `${raw.spread} -> ${dwelt.spread}`);
+
+  const clamped = await spread({ vbwHz: 1_000_000, captureMs: 99_999 });
+  assert.equal(clamped.applied.vbwHz, 10_000, 'never wider than the RBW');
+  assert.equal(clamped.applied.captureMs, 1_000);
+  const floored = await spread({ vbwHz: 10, captureMs: 0 });
+  assert.equal(floored.applied.vbwHz, 1_000, 'never under 1 kHz');
+  assert.equal(floored.applied.captureMs, 1);
 });
 
 test('more points than the device has bins still fills every point', { skip }, async (t) => {

@@ -57,7 +57,34 @@ const DEFAULT_AUTO_POINTS = true;
 const MIN_REF_LEVEL_DBM = -70;
 const MAX_REF_LEVEL_DBM = 20;
 const DEFAULT_REF_LEVEL_DBM = -20;
-const DETECTORS = ['peak', 'average'];
+// Average first, so it is the default: mean power over the capture, which
+// puts the noise floor where it really is. Peak holds the maximum instead,
+// which catches a burst and lifts the floor by several dB doing it.
+const DETECTORS = ['average', 'peak'];
+
+// Video bandwidths. 1 kHz is the floor, as for RBW: the Apple Silicon library
+// accepts a narrower one and ignores it.
+const VBW_HZ = RBW_HZ;
+const MIN_VBW_HZ = VBW_HZ[0];
+
+// Dwell: how long the analyzer samples for one sweep, which is what steadies
+// the trace — it averages every spectrum it captures in that time. The time
+// needed for a given steadiness is inversely proportional to the RBW, so each
+// dwell is a budget in milliseconds at 1 kHz RBW. Measured on a BB60C, 470-616
+// MHz: `coordination` holds sweep-to-sweep noise to about 1 dB (from about 5),
+// `hq` to about 0.5 dB, and `fast` does no averaging at all.
+const DWELL_MS_AT_1KHZ = { fast: 0, coordination: 200, hq: 600 };
+const DWELLS = Object.keys(DWELL_MS_AT_1KHZ);
+const DEFAULT_DWELL = 'coordination';
+const MIN_CAPTURE_MS = 1;
+const MAX_CAPTURE_MS = 1_000;
+
+const captureMsFor = (dwell, rbwHz) =>
+  clamp(
+    Math.round(DWELL_MS_AT_1KHZ[dwell] / (rbwHz / 1_000)),
+    MIN_CAPTURE_MS,
+    MAX_CAPTURE_MS
+  );
 
 const ADC_OVERFLOW = 2; // bbADCOverflow
 const MIN_USB_VOLTS = 4.4; // below this, Signal Hound says readings are out of spec
@@ -66,10 +93,11 @@ const OVERLOAD_HOLD_MS = 3_000;
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 
-const nearestRbw = (hz) =>
-  RBW_HZ.reduce((best, candidate) =>
+const nearestOf = (list, hz) =>
+  list.reduce((best, candidate) =>
     Math.abs(candidate - hz) < Math.abs(best - hz) ? candidate : best
   );
+const nearestRbw = (hz) => nearestOf(RBW_HZ, hz);
 
 /** The narrowest listed RBW the device can sweep live across `spanHz`. */
 const narrowestRbwFor = (spanHz) => {
@@ -185,6 +213,7 @@ class Bb60Adapter {
         minFrequencyHz: MIN_FREQUENCY_HZ,
         maxFrequencyHz: MAX_FREQUENCY_HZ,
         rbwHz: [...RBW_HZ],
+        vbwHz: [...VBW_HZ],
         controls: [
           {
             id: 'refLevelDbm',
@@ -195,25 +224,36 @@ class Bb60Adapter {
             min: MIN_REF_LEVEL_DBM,
             max: MAX_REF_LEVEL_DBM,
             step: 5,
-            help: 'Set about 5 dB above the strongest signal you expect. Raise it if the analyzer reports an overload.',
+            help: 'Raise it if the analyzer reports an overload.',
+          },
+          {
+            id: 'dwell',
+            type: 'dropdown',
+            label: 'Dwell',
+            default: DEFAULT_DWELL,
+            choices: [
+              { id: 'fast', label: 'Fast' },
+              { id: 'coordination', label: 'Coordination' },
+              { id: 'hq', label: 'High quality' },
+            ],
+            help: 'Longer is steadier and slower.',
           },
           {
             id: 'detector',
             type: 'dropdown',
             label: 'Detector',
-            default: 'peak',
+            default: DETECTORS[0],
             choices: [
-              { id: 'peak', label: 'Peak' },
-              { id: 'average', label: 'Average' },
+              { id: 'average', label: 'RMS average' },
+              { id: 'peak', label: 'Positive peak' },
             ],
-            help: 'Peak never misses a carrier narrower than a trace point. Average shows the mean power in each point.',
           },
           {
             id: 'autoPoints',
             type: 'checkbox',
-            label: 'Automatic points per sweep',
+            label: 'Auto points',
             default: DEFAULT_AUTO_POINTS,
-            help: `Sets the number of points from the span and RBW (${AUTO_POINTS_PER_RBW} per RBW), up to ${(MAX_AUTO_POINTS - 1).toLocaleString('en-US')}, and ignores the point count above. Turn it off to set the point count yourself.`,
+            help: `${AUTO_POINTS_PER_RBW} per RBW. Overrides the point count.`,
           },
         ],
       },
@@ -282,12 +322,31 @@ class Bb60Adapter {
     const detector = DETECTORS.includes(controls.detector)
       ? controls.detector
       : (previous.detector ?? DETECTORS[0]);
+    const dwell = DWELLS.includes(controls.dwell)
+      ? controls.dwell
+      : (previous.dwell ?? DEFAULT_DWELL);
+
+    // An automatic VBW is a tenth of the RBW — the usual ratio, and the one
+    // thing that steadies a span too wide for the capture time to matter —
+    // except at the fast dwell, which asks for no averaging of any kind.
+    const explicitVbw = isNum(cfg.vbwHz);
+    const vbwHz = clamp(
+      explicitVbw
+        ? nearestOf(VBW_HZ, cfg.vbwHz)
+        : dwell === 'fast'
+          ? rbwHz
+          : rbwHz / 10,
+      MIN_VBW_HZ,
+      rbwHz
+    );
 
     const applied = await this.#worker().configure({
       startHz,
       stopHz,
       pointCount,
       rbwHz,
+      vbwHz,
+      captureMs: captureMsFor(dwell, rbwHz),
       refLevelDbm,
       detector,
     });
@@ -300,6 +359,7 @@ class Bb60Adapter {
       autoPoints,
       refLevelDbm: applied.refLevelDbm,
       detector: applied.detector,
+      dwell,
     };
     // the reference level changed what counts as an overload
     this.overloadedAt = 0;
@@ -309,6 +369,9 @@ class Bb60Adapter {
     // An automatic RBW is reported as what auto resolved to, so the user's
     // field keeps showing "auto"; an explicit one as what the device took.
     if (!explicitRbw) resolved.rbwHz = applied.rbwHz;
+    // The VBW in force, always: the shell echoes the one that was asked for,
+    // and this is where the host learns what it was clamped or resolved to.
+    resolved.vbwHz = applied.vbwHz;
     return {
       startHz: applied.startHz,
       stopHz: applied.stopHz,
@@ -317,6 +380,7 @@ class Bb60Adapter {
       controls: {
         refLevelDbm: applied.refLevelDbm,
         detector: applied.detector,
+        dwell,
         autoPoints,
       },
       resolved,
